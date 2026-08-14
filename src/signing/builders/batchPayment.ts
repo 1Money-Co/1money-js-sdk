@@ -7,6 +7,7 @@ import {
 import {
   assertAddress,
   assertNonNegativeInteger,
+  U256_MAX,
   validateChainAndNonce
 } from './validate';
 
@@ -23,8 +24,6 @@ export type BatchPaymentUnsigned =
 const OPERATIONS_HASH_RE =
   /^0x[0-9a-fA-F]{64}$/;
 const DECIMAL_UINT_RE = /^\d+$/;
-const U256_MAX =
-  (BigInt(1) << BigInt(256)) - BigInt(1);
 const ZERO_ADDRESS = `0x${'00'.repeat(20)}`;
 
 // `operations_hash`/`batch_id` are declared as optional (`?:`)

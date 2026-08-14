@@ -139,6 +139,16 @@ All builders take `chain_id: number` and `nonce: number`. Fields below are the
 Addresses are EIP-55 `0x…` strings. Every operation below accepts the `memo`
 option (see [Memo](#memo-always-sent-on-v2) below).
 
+Every `value` / amount / `escrow_fee` field is a `U256` on the node, and
+`prepare` rejects anything above `U256::MAX` (`2^256 - 1`) with
+`Invalid <field>: exceeds U256::MAX`. This is an encodability check, not an
+admission rule: a larger number has no wire form at all — the node fails while
+deserializing the request body and answers HTTP 400
+`validation_invalid_param` ("expected a 32 byte hex string") before reading any
+state. Rejecting it locally means no signing operation is spent on a request
+that can never be decoded, which matters for an HSM- or KMS-backed signer.
+`U256::MAX` itself is accepted.
+
 ### payment → transactions.payment
 ```typescript
 TransactionBuilder.payment({ chain_id, nonce, recipient, value, token }, { memo });

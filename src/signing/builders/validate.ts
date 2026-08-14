@@ -2,6 +2,20 @@ import { isAddress } from 'viem';
 
 const UINT_STRING_RE = /^\d+$/;
 
+// Every uint-string field validated in this module is a U256 on the node.
+// A value above this has no wire form at all: alloy's deserializer rejects
+// it while parsing the request body, before any state is read. Verified
+// against a local node -- `value` of 2^256 returns HTTP 400
+// validation_invalid_param, `invalid value: string "1157...936", expected a
+// 32 byte hex string`, whereas the same request with a small value gets
+// past parsing and fails later on state lookup.
+//
+// So this is an encodability check, not an admission rule: without it the
+// SDK computes a signing hash, spends a signing operation, and ships a
+// request the node cannot even decode.
+export const U256_MAX =
+  (BigInt(1) << BigInt(256)) - BigInt(1);
+
 function fail(name: string, value: unknown): never {
   throw new Error(
     `[1Money SDK]: Invalid ${name}: ${String(value)}`
@@ -49,6 +63,13 @@ export function assertUintString(
 ) {
   if (!UINT_STRING_RE.test(value)) {
     fail(name, value);
+  }
+  // Checked after the format test so a non-numeric string still reports the
+  // format error rather than throwing inside BigInt().
+  if (BigInt(value) > U256_MAX) {
+    throw new Error(
+      `[1Money SDK]: Invalid ${name}: exceeds U256::MAX`
+    );
   }
 }
 

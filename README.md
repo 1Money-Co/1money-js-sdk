@@ -196,6 +196,13 @@ digest → `authorize` → submit the resulting `AuthorizedTxV2`. See
 every builder's fields, and the legacy `LegacyV1TransactionBuilder` /
 `api().<module>.legacyV1.*` path.
 
+Amount fields (`value`, batch `amount`, `escrow_fee`, authority `value`) are
+decimal strings holding a `U256`. `prepare` rejects anything above `U256::MAX`
+with `exceeds U256::MAX` before signing — such a number has no wire form at
+all, so the node would fail deserializing the request body (HTTP 400
+`validation_invalid_param`) and the signature would have been wasted.
+`U256::MAX` itself is valid.
+
 ### Chain API
 
 #### Get Chain ID

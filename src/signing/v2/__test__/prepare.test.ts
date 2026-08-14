@@ -290,4 +290,83 @@ describe('native v2 prepare', function () {
       data: 'invoice-1'
     });
   });
+  // A value above U256::MAX has no wire form: the node rejects it while
+  // parsing the request body, before reading any state. Verified against a
+  // local node -- 2^256 returns HTTP 400 validation_invalid_param
+  // ('expected a 32 byte hex string'), while the same request with a small
+  // value gets past parsing and fails later on state lookup. Signing one is
+  // therefore always wasted, and on an HSM- or KMS-backed signer it costs a
+  // real signing operation.
+  describe('U256 upper bound', function () {
+    const A =
+      '0x0202020202020202020202020202020202020202';
+    const OVER = (
+      BigInt(1) << BigInt(256)
+    ).toString();
+    const MAX = (
+      (BigInt(1) << BigInt(256)) - BigInt(1)
+    ).toString();
+
+    const build: Record<
+      string,
+      (value: string) => unknown
+    > = {
+      'payment.value': value =>
+        TransactionBuilderV2.payment({
+          ...PAYMENT,
+          value
+        }),
+      'tokenMint.value': value =>
+        TransactionBuilderV2.tokenMint({
+          chain_id: 1212101,
+          nonce: 1,
+          recipient: A,
+          value,
+          token: TOKEN
+        }),
+      'tokenBurn.value': value =>
+        TransactionBuilderV2.tokenBurn({
+          chain_id: 1212101,
+          nonce: 1,
+          value,
+          token: TOKEN
+        }),
+      'tokenClawback.value': value =>
+        TransactionBuilderV2.tokenClawback({
+          chain_id: 1212101,
+          nonce: 1,
+          token: TOKEN,
+          from: A,
+          recipient: A,
+          value
+        }),
+      'tokenBurnAndBridge.escrow_fee': value =>
+        TransactionBuilderV2.tokenBurnAndBridge({
+          chain_id: 1212101,
+          nonce: 1,
+          sender: A,
+          value: '1',
+          token: TOKEN,
+          destination_chain_id: 1,
+          destination_address: A,
+          escrow_fee: value,
+          bridge_metadata: 'm',
+          bridge_param: '0x'
+        } as never)
+    };
+
+    for (const [field, make] of Object.entries(
+      build
+    )) {
+      it(`rejects ${field} above U256::MAX`, function () {
+        expect(() => make(OVER)).to.throw(
+          /exceeds U256::MAX/
+        );
+      });
+
+      it(`accepts ${field} at exactly U256::MAX`, function () {
+        expect(() => make(MAX)).to.not.throw();
+      });
+    }
+  });
 });
