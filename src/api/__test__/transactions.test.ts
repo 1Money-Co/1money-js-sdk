@@ -8,10 +8,15 @@ import {
   TransactionSubmissionError
 } from '../errors';
 import transactionsApi from '../transactions';
-import type { BatchExecutionEvent } from '../transactions/types';
+import type {
+  BatchExecutionEvent,
+  Transaction
+} from '../transactions/types';
 import {
   batchPaymentReceiptFixture,
   batchPaymentTransactionFixture,
+  multisigTransactionFixture,
+  pendingTransactionFixture,
   finalizedBatchPaymentReceiptFixture,
   paymentSuccessReceiptFixture,
   ZERO_ADDRESS
@@ -61,6 +66,117 @@ describe('transaction response models', function () {
       checkpoint_number: 9,
       epoch: 12
     });
+  });
+
+  it('exposes the v2 signature scheme on the read model', function () {
+    // The node returns signature_scheme: 'domain_separated' for every
+    // domain-separated v2 transaction and omits the key for legacy ones, so
+    // presence of that value is how a caller identifies a v2 submission.
+    expect(
+      batchPaymentTransactionFixture.signature_scheme
+    ).to.equal('domain_separated');
+
+    // Absence is the legacy signal, and must stay assignable.
+    const legacy: Transaction = {
+      ...batchPaymentTransactionFixture,
+      signature_scheme: undefined
+    };
+    expect(legacy.signature_scheme).to.equal(undefined);
+  });
+
+  it('accepts null placement fields before checkpoint inclusion', function () {
+    // The node emits these keys with a null value rather than omitting them,
+    // because their Option carries no skip_serializing_if. Verified on a live
+    // node: 65ms after submission a transaction read returned all three as
+    // null. Declaring them `?: number` alone made this real response shape
+    // unassignable.
+    expect(
+      pendingTransactionFixture.transaction_index
+    ).to.equal(null);
+    expect(
+      pendingTransactionFixture.checkpoint_number
+    ).to.equal(null);
+    expect(
+      pendingTransactionFixture.checkpoint_hash
+    ).to.equal(null);
+
+    // Null is distinct from absent here, so the keys must be present.
+    expect(pendingTransactionFixture).to.have.property(
+      'transaction_index'
+    );
+
+    // The fields the node really does omit must stay null-free, so that
+    // `?: T` without null keeps meaning "absent" for them.
+    expect(
+      batchPaymentReceiptFixture.success_info
+    ).to.not.equal(null);
+  });
+
+  it('narrows the signature shape on signature_type', function () {
+    // The point of the discriminated union: this function compiles only
+    // because signature_type narrows signature. Before, `signature` was
+    // declared { r, s, v } for every variant, so the Multi branch below read
+    // undefined at runtime while type-checking fine.
+    function describeAuth(tx: Transaction): string {
+      switch (tx.signature_type) {
+        case 'Single':
+          return `single:${tx.signature.r}`;
+        case 'Multi':
+          return `multi:${tx.signature.account}:${tx.signature.signatures.length}`;
+      }
+    }
+
+    expect(
+      describeAuth(batchPaymentTransactionFixture)
+    ).to.equal('single:0x01');
+    expect(
+      describeAuth(multisigTransactionFixture)
+    ).to.equal(
+      `multi:${multisigTransactionFixture.signature.account}:2`
+    );
+
+    // The multisig authorization genuinely has no r/s/v at the top level --
+    // that is exactly what the old type claimed was there.
+    expect(
+      multisigTransactionFixture.signature
+    ).to.not.have.property('r');
+    expect(
+      multisigTransactionFixture.signature
+        .signatures[0].signer_pubkey
+    ).to.match(/^0x0[23][0-9a-f]{64}$/);
+  });
+
+  it('models the finalized counter-signature as a single BLS aggregate', function () {
+    // The node returns one aggregate, never a per-validator array. Asserting
+    // the singular key by name is what catches a regression back to
+    // `counter_signatures`, which would silently read as undefined.
+    expect(
+      finalizedBatchPaymentReceiptFixture
+    ).to.have.property('counter_signature');
+    expect(
+      finalizedBatchPaymentReceiptFixture
+    ).to.not.have.property('counter_signatures');
+
+    const aggregate =
+      finalizedBatchPaymentReceiptFixture.counter_signature;
+    expect(Object.keys(aggregate).sort()).to.deep.equal([
+      'signature',
+      'signer_bitmask',
+      'validator_public_keys'
+    ]);
+    expect(aggregate.signature).to.match(/^0x[0-9a-f]{96}$/);
+    expect(
+      aggregate.validator_public_keys
+    ).to.be.an('array');
+
+    // fee is what the validators signed over; fee_used is what was charged.
+    // They are separate fields and must both survive.
+    expect(
+      finalizedBatchPaymentReceiptFixture.fee
+    ).to.equal('15');
+    expect(
+      finalizedBatchPaymentReceiptFixture.fee_bound
+    ).to.equal(true);
   });
 });
 

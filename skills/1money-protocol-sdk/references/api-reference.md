@@ -137,11 +137,11 @@ quotes, not signed fee caps or admission guarantees.
 interface TransactionReceipt {
   success: boolean;            // did the tx succeed on-chain
   transaction_hash: string;
-  transaction_index?: number;
+  transaction_index?: number | null;   // null until checkpoint inclusion
   fee_used: string;            // decimal string; preserves full precision
   from: string;
-  checkpoint_hash?: string;
-  checkpoint_number?: number;
+  checkpoint_hash?: string | null;     // null until checkpoint inclusion
+  checkpoint_number?: number | null;   // null until checkpoint inclusion
   recipient?: string | null;   // replaces the former `to` field
   token_address?: string | null;
   success_info?: {
@@ -183,8 +183,21 @@ interface TransactionReceipt {
   >;
 }
 // FinalizedTransactionReceipt extends it with:
-//   epoch: number; counter_signatures: { r; s; v }[]
+//   epoch: number;
+//   counter_signature: {            // SINGULAR -- one BLS aggregate, not
+//     signer_bitmask: string;       // a per-validator array. Bit i maps to
+//     signature: string;            // validator_public_keys[i]; both are
+//     validator_public_keys: string[]; // needed to verify the aggregate.
+//   };
+//   fee?: string | null;            // fee bound into the counter-sign
+//                                   // domain; null for fee-less txs and
+//                                   // legacy certs. NOT the same as the
+//                                   // receipt's fee_used (what was charged).
+//   fee_bound?: boolean;            // true = V2 fee-bound domain
 ```
+
+There is no `counter_signatures` array on this response and there never was —
+reading that key yields `undefined`.
 
 `FinalizedTransactionReceipt` inherits every common receipt field above, so
 callers of finalized reads must migrate `fee_used` from number to string and
@@ -200,10 +213,48 @@ actual recipient addresses and amounts. `batch_info.failure` is currently
 'TokenWhitelistAccount' |
 'TokenBridgeAndMint' | 'TokenBurn' | 'TokenBurnAndBridge' | 'TokenClawback' |
 'TokenCloseAccount' | 'TokenPause' | 'TokenUnpause' | 'TokenUpdateMetadata' |
-'CreateMultiSig' | 'Raw'`). All variants share `hash`, `chain_id`, `from`, `nonce`, `signature`,
-plus optional `checkpoint_*`/`transaction_index` and an optional `memo` (present
+'CreateMultiSig' | 'Raw'`). All variants share `hash`, `chain_id`, `from`, `nonce`,
+plus nullable `checkpoint_*`/`transaction_index` and an optional `memo` (present
 only for V2/memo-bearing txs); each carries a `data` object specific to its type.
 Narrow on `transaction_type` before reading `data`.
+
+**`signature` is a discriminated union, not a fixed `{ r, s, v }`.** The node
+tags the authorization adjacently, so `signature_type` names the shape held in
+`signature` — narrow on it before reading:
+
+```typescript
+switch (tx.signature_type) {
+  case 'Single':
+    tx.signature.r;                     // RestSignature { r, s, v }
+    break;
+  case 'Multi':
+    tx.signature.account;               // the multisig account
+    tx.signature.signatures;            // [{ signer_pubkey, signature }]
+    break;
+}
+```
+
+Reading `tx.signature.r` unconditionally yields `undefined` on every multisig
+transaction.
+
+**`null` and absent mean different things on these responses.** A node-side
+`Option` without `skip_serializing_if` emits the key with a `null` value, so
+`checkpoint_hash`, `checkpoint_number`, `transaction_index`, `recipient`,
+`token_address` and the finalized `fee` are all *nullable*, not merely
+optional — a transaction read succeeds before checkpoint inclusion and returns
+the first three as `null`. `memo`, `signature_scheme`, `success_info`,
+`batch_info` and `execution_events` are the genuinely omitted ones, so for
+those `?: T` without `| null` is correct. Prefer `field == null` (or `?.`)
+over `field === undefined` when you mean "not set yet".
+
+`signature_scheme?: SignatureScheme` reports how the transaction was
+authorized — `'legacy_native' | 'domain_separated' | 'ethereum' | 'eip712'`,
+the same wire values the Go SDK exposes. The node omits the key rather than
+sending null, and its REST layer only ever assigns `'domain_separated'`, so
+**`signature_scheme === 'domain_separated'` identifies a native-v2
+transaction and an absent key means legacy**. The other three values are
+declared by the node's enum and typed here so a future response cannot break
+the union, but transaction reads do not emit them today.
 
 For `transaction_type: 'BatchPayment'`, `data` has the independently modeled
 read shape `{ token, operations, operations_hash, batch_id, created_at }`; its

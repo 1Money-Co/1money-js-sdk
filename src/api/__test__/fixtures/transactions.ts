@@ -100,16 +100,25 @@ export const forwardCompatibleBatchFailureFixture = {
   }
 } satisfies BatchReceiptInfo;
 
+// Shaped after a real finalized response from a local node: a singular
+// `counter_signature` BLS aggregate plus `fee` and `fee_bound`. The previous
+// version of this fixture declared `counter_signatures: [{ r, s, v }]`, an
+// ECDSA-shaped array the node has never returned -- and because it was
+// `satisfies FinalizedTransactionReceipt`, it type-checked against the
+// equally wrong interface and confirmed nothing.
 export const finalizedBatchPaymentReceiptFixture = {
   ...batchPaymentReceiptFixture,
   epoch: 12,
-  counter_signatures: [
-    {
-      r: '0x01',
-      s: '0x02',
-      v: 27
-    }
-  ]
+  counter_signature: {
+    signer_bitmask: '0x7f',
+    signature: `0x${'ab'.repeat(48)}`,
+    validator_public_keys: [
+      `0x${'c1'.repeat(96)}`,
+      `0x${'c2'.repeat(96)}`
+    ]
+  },
+  fee: '15',
+  fee_bound: true
 } satisfies FinalizedTransactionReceipt;
 
 export const batchPaymentTransactionFixture = {
@@ -120,11 +129,17 @@ export const batchPaymentTransactionFixture = {
   chain_id: 1,
   from: SENDER,
   nonce: 3,
+  // The node tags the authorization adjacently, so signature_type names the
+  // shape in signature. Always present on a read.
+  signature_type: 'Single',
   signature: {
     r: '0x01',
     s: '0x02',
-    v: 27
+    v: 1
   },
+  // Present and 'domain_separated' is what the node returns for a v2
+  // submission; a legacy transaction omits the key entirely.
+  signature_scheme: 'domain_separated',
   transaction_type: 'BatchPayment',
   data: {
     token: TOKEN,
@@ -145,3 +160,61 @@ export const batchPaymentTransactionFixture = {
 } satisfies Transaction;
 
 void batchPaymentDataHasNoMaxFee;
+
+// A multisig-authorized read. Its `signature` is { account, signatures },
+// not { r, s, v } -- the shape the previous BaseTransaction could not express
+// and which callers silently read as undefined.
+export const multisigTransactionFixture = {
+  hash: TRANSACTION_HASH,
+  chain_id: 1,
+  from: SENDER,
+  nonce: 4,
+  signature_type: 'Multi',
+  signature: {
+    account: SENDER,
+    signatures: [
+      {
+        signer_pubkey: `0x02${'11'.repeat(32)}`,
+        signature: { r: '0x01', s: '0x02', v: 0 }
+      },
+      {
+        signer_pubkey: `0x03${'22'.repeat(32)}`,
+        signature: { r: '0x03', s: '0x04', v: 1 }
+      }
+    ]
+  },
+  signature_scheme: 'domain_separated',
+  transaction_type: 'TokenTransfer',
+  data: {
+    recipient: RECIPIENT,
+    value: '10',
+    token: TOKEN
+  }
+} satisfies Transaction;
+
+// A transaction read before checkpoint inclusion. All three placement fields
+// come back as null, not absent -- observed on a live node 65ms after
+// submission. The previous `transaction_index?: number` excluded this, the
+// one shape a caller polling for inclusion actually sees first.
+export const pendingTransactionFixture = {
+  hash: TRANSACTION_HASH,
+  checkpoint_hash: null,
+  checkpoint_number: null,
+  transaction_index: null,
+  chain_id: 1,
+  from: SENDER,
+  nonce: 5,
+  signature_type: 'Single',
+  signature: {
+    r: '0x01',
+    s: '0x02',
+    v: 0
+  },
+  signature_scheme: 'domain_separated',
+  transaction_type: 'TokenTransfer',
+  data: {
+    recipient: RECIPIENT,
+    value: '10',
+    token: TOKEN
+  }
+} satisfies Transaction;

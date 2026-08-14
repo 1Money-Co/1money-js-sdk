@@ -68,22 +68,72 @@ export type BatchExecutionEvent =
 export interface TransactionReceipt {
   success: boolean;
   transaction_hash: B256Schema;
-  transaction_index?: number;
+  /**
+   * The three checkpoint-placement fields below are `null` — not absent —
+   * until the transaction is included in a checkpoint. Their node-side
+   * `Option` carries no `skip_serializing_if`, so serde emits the key with a
+   * `null` value. Observed on a live node 65ms after submission: all three
+   * read `null` on the same response.
+   */
+  transaction_index?: number | null;
   fee_used: string;
   from: AddressSchema;
-  checkpoint_hash?: B256Schema;
-  checkpoint_number?: number;
+  checkpoint_hash?: B256Schema | null;
+  checkpoint_number?: number | null;
   recipient?: AddressSchema | null;
   token_address?: AddressSchema | null;
+  /**
+   * These three, by contrast, are genuinely absent when unset: the node
+   * marks them `skip_serializing_if` (`Option::is_none` for the first two,
+   * `Vec::is_empty` for the events), so no `null` ever appears.
+   */
   success_info?: SuccessInfo;
   batch_info?: BatchReceiptInfo;
   execution_events?: BatchExecutionEvent[];
 }
 
+/**
+ * Validator BLS aggregate that certifies finalization.
+ *
+ * Mirrors the node's `RestBlsAggregateSignature`. This is a single
+ * aggregate, not a list of per-validator signatures: `signature` is one
+ * BLS12-381 aggregate over the counter-sign domain, and `signer_bitmask`
+ * says which validators contributed to it. Bit i of the bitmask
+ * corresponds to index i of `validator_public_keys`, so both are needed
+ * to verify the aggregate.
+ */
+export interface BlsAggregateSignature {
+  /** Hex bitmask of contributing validators, e.g. '0x7f'. */
+  signer_bitmask: string;
+  /** The 48-byte BLS12-381 aggregate signature, hex encoded. */
+  signature: string;
+  /** Ordered validator BLS public keys; index matches bitmask bit. */
+  validator_public_keys: string[];
+}
+
 // Finalized transaction receipt response
 export interface FinalizedTransactionReceipt extends TransactionReceipt {
   epoch: number;
-  counter_signatures: RestSignature[];
+  /**
+   * Singular BLS aggregate. Note this is NOT `counter_signatures: []` --
+   * the node has never returned a per-validator array here.
+   */
+  counter_signature: BlsAggregateSignature;
+  /**
+   * The fee bound into the counter-sign domain for fee-bound (V2)
+   * certificates: a decimal string for fee-bearing transactions
+   * (payments), `null` for fee-less ones (token operations) and for legacy
+   * certificates. Distinct from the receipt's `fee_used` -- this is the
+   * value the validators signed over, not what was charged. Optional
+   * because a node predating the field omits it entirely.
+   */
+  fee?: string | null;
+  /**
+   * True when the aggregate is over the V2 fee-bound counter-sign domain
+   * `signature_hash_for_counter_sign_v2(tx_hash, epoch, fee)`. Absent or
+   * false means v1 verification. Optional for the same reason as `fee`.
+   */
+  fee_bound?: boolean;
 }
 
 // Estimate fee response
@@ -257,29 +307,102 @@ export interface CreateMultiSigData {
   multisig_address: AddressSchema;
 }
 
+/**
+ * How a transaction's authorization was produced, as reported by the node.
+ *
+ * Wire values are lowercase snake_case, mirroring the node's
+ * `SignatureScheme` enum and the Go SDK's constants of the same name so both
+ * SDKs expose the same surface.
+ */
+export type SignatureScheme =
+  | 'legacy_native'
+  | 'domain_separated'
+  | 'ethereum'
+  | 'eip712';
+
+/** One signer's contribution inside a multisig authorization. */
+export interface MultiSigSignatureEntry {
+  /** Signer's 33-byte SEC1-compressed public key, hex encoded. */
+  signer_pubkey: string;
+  signature: RestSignature;
+}
+
+/** The `signature` content when `signature_type` is `'Multi'`. */
+export interface MultiSignature {
+  /** The multisig account the signatures authorize for. */
+  account: AddressSchema;
+  signatures: MultiSigSignatureEntry[];
+}
+
+/**
+ * The authorization carried by a transaction read.
+ *
+ * The node tags this adjacently
+ * (`#[serde(tag = "signature_type", content = "signature")]`), so
+ * `signature_type` names the shape held in `signature` — the two fields are
+ * correlated, not independent. Modelling them as one union is what lets
+ * `if (tx.signature_type === 'Single')` narrow `tx.signature` to
+ * `{ r, s, v }`.
+ *
+ * Declaring `signature` as a plain `{ r, s, v }`, as this SDK did before,
+ * silently reads `undefined` on every multisig transaction, whose
+ * `signature` is `{ account, signatures }` instead. Declaring it as a bare
+ * `RestSignature | MultiSignature` without the discriminant would compile
+ * but never narrow.
+ */
+export type TransactionAuthorization =
+  | {
+      signature_type: 'Single';
+      signature: RestSignature;
+    }
+  | {
+      signature_type: 'Multi';
+      signature: MultiSignature;
+    };
+
 // Base transaction fields shared by all transaction types
-interface BaseTransaction {
+interface BaseTransactionFields {
   hash: B256Schema;
 
-  checkpoint_hash?: B256Schema;
-  checkpoint_number?: number;
-  transaction_index?: number;
+  // `null` until the transaction lands in a checkpoint -- the node emits the
+  // key with a null value rather than omitting it. A transaction read
+  // succeeds before inclusion, so this is a state callers do observe.
+  checkpoint_hash?: B256Schema | null;
+  checkpoint_number?: number | null;
+  transaction_index?: number | null;
 
   chain_id: number;
   from: AddressSchema;
   nonce: number;
-  signature: {
-    r: string;
-    s: string;
-    v: number;
-  };
   /**
    * Signed memo attached to the transaction. Populated only for V2
    * (memo-bearing) envelope variants; omitted when the transaction was
    * a legacy variant.
    */
   memo?: Memo;
+  /**
+   * How this transaction was authorized.
+   *
+   * Optional because the node omits the key entirely rather than sending
+   * null (`skip_serializing_if = "Option::is_none"`), which keeps
+   * pre-existing REST JSON byte-identical. On this endpoint today the node's
+   * REST layer only ever assigns `'domain_separated'` and leaves every
+   * legacy Single/Multi signature unset, whatever its provenance — so in
+   * practice **present and `'domain_separated'` means native-v2, absent
+   * means legacy**. The remaining three values are declared by the node's
+   * enum and typed here so a future response cannot break the union, but
+   * they are not currently emitted on transaction reads.
+   */
+  signature_scheme?: SignatureScheme;
 }
+
+/**
+ * Every transaction read carries the shared fields plus a correlated
+ * `signature_type` / `signature` pair. Narrow on `signature_type` before
+ * reading `signature`.
+ */
+type BaseTransaction = BaseTransactionFields &
+  TransactionAuthorization;
 
 // Discriminated union for all transaction types
 export type Transaction =
