@@ -2430,4 +2430,307 @@ describe('native v2 lifecycle integration', function () {
     );
     expect(transaction.memo).to.deep.equal(memo);
   });
+  // The read-model corrections these guard were all cases of the SDK's type
+  // disagreeing with the node's wire shape. Fixtures cannot catch that class
+  // of defect -- the previous finalized fixture declared an ECDSA-shaped
+  // `counter_signatures` array and type-checked cleanly against the equally
+  // wrong interface. Only a live response can.
+  describe('read model vs the node wire shape', function () {
+    // Mirrors the declared TS surface. A key the node sends that is missing
+    // here is drift: the SDK is silently dropping data callers cannot reach.
+    const TRANSACTION_KEYS = [
+      'hash',
+      'checkpoint_hash',
+      'checkpoint_number',
+      'transaction_index',
+      'chain_id',
+      'from',
+      'nonce',
+      'signature',
+      'signature_type',
+      'memo',
+      'signature_scheme',
+      'transaction_type',
+      'data'
+    ];
+    const FINALIZED_KEYS = [
+      'success',
+      'transaction_hash',
+      'transaction_index',
+      'fee_used',
+      'from',
+      'checkpoint_hash',
+      'checkpoint_number',
+      'recipient',
+      'token_address',
+      'success_info',
+      'batch_info',
+      'execution_events',
+      'epoch',
+      'counter_signature',
+      'fee',
+      'fee_bound'
+    ];
+
+    function assertNoUnmodelledKeys(
+      value: object,
+      declared: string[],
+      label: string
+    ): void {
+      const extra = Object.keys(value).filter(
+        key => !declared.includes(key)
+      );
+      expect(
+        extra,
+        `${label} returned keys the SDK does not model: ${extra.join(', ')}`
+      ).to.deep.equal([]);
+    }
+
+    async function submitPayment(): Promise<string> {
+      const nonce = (
+        await context.client.accounts.getNonce(
+          context.accounts.user2.address
+        )
+      ).nonce;
+      const prepared = TransactionBuilder.payment({
+        chain_id: chainId,
+        nonce,
+        recipient: context.accounts.user3.address,
+        value: '1',
+        token: tokenAddress
+      });
+      const { response } =
+        await authorizeAndSubmitV2(
+          prepared,
+          user2Signer,
+          authorized =>
+            context.client.transactions.payment(
+              authorized
+            )
+        );
+      return response.hash;
+    }
+
+    it('returns a singular counter_signature BLS aggregate on a finalized read', async function () {
+      const hash = await submitPayment();
+      const finalized = await waitForResult(
+        () =>
+          context.client.transactions.getFinalizedByHash(
+            hash
+          ),
+        RECEIPT_POLL
+      );
+
+      // The defect this replaces: `counter_signatures: RestSignature[]`,
+      // which read as undefined against every real response.
+      expect(finalized).to.not.have.property(
+        'counter_signatures'
+      );
+      expect(finalized).to.have.property(
+        'counter_signature'
+      );
+
+      const aggregate = finalized.counter_signature;
+      expect(
+        Object.keys(aggregate).sort()
+      ).to.deep.equal([
+        'signature',
+        'signer_bitmask',
+        'validator_public_keys'
+      ]);
+      // BLS12-381 aggregate: 48 bytes.
+      expect(aggregate.signature).to.match(
+        /^0x[0-9a-f]{96}$/
+      );
+      expect(
+        aggregate.signer_bitmask
+      ).to.match(/^0x[0-9a-f]+$/);
+      expect(
+        aggregate.validator_public_keys.length
+      ).to.be.greaterThan(0);
+
+      expect(finalized.fee_bound).to.be.a('boolean');
+      assertNoUnmodelledKeys(
+        finalized,
+        FINALIZED_KEYS,
+        'finalized read'
+      );
+    });
+
+    it('reports fee as a string for a payment and null for a fee-less operation', async function () {
+      // Exactly why `fee` is typed `string | null`: the node binds a fee into
+      // the counter-sign domain only for fee-bearing transactions. A token
+      // operation carries none and the key comes back null, not absent.
+      const paymentHash = await submitPayment();
+
+      const metadataNonce = (
+        await context.client.accounts.getNonce(
+          context.accounts.master.address
+        )
+      ).nonce;
+      const metadataPrepared =
+        TransactionBuilder.tokenMetadata({
+          chain_id: chainId,
+          nonce: metadataNonce,
+          name: 'Updated V2 Integration Token',
+          uri: 'https://example.com/v2-token.json',
+          token: tokenAddress,
+          additional_metadata: [
+            { key: 'suite', value: 'v2-lifecycle' }
+          ]
+        });
+      const { response: metadataResponse } =
+        await authorizeAndSubmitV2(
+          metadataPrepared,
+          masterSigner,
+          authorized =>
+            context.client.tokens.updateMetadata(
+              authorized
+            )
+        );
+
+      const [payment, tokenOperation] =
+        await Promise.all([
+          waitForResult(
+            () =>
+              context.client.transactions.getFinalizedByHash(
+                paymentHash
+              ),
+            RECEIPT_POLL
+          ),
+          waitForResult(
+            () =>
+              context.client.transactions.getFinalizedByHash(
+                metadataResponse.hash
+              ),
+            RECEIPT_POLL
+          )
+        ]);
+
+      expect(payment.fee).to.be.a('string');
+      expect(tokenOperation.fee).to.equal(null);
+      // Null, not absent -- the key itself must be present.
+      expect(tokenOperation).to.have.property('fee');
+    });
+
+    it('reports the v2 signature scheme and a narrowable signature on a transaction read', async function () {
+      const hash = await submitPayment();
+      const transaction = await waitForResult(
+        () =>
+          context.client.transactions.getByHash(
+            hash
+          ),
+        RECEIPT_POLL
+      );
+
+      // Everything this suite submits goes through the v2 pipeline.
+      expect(
+        transaction.signature_scheme
+      ).to.equal('domain_separated');
+
+      // signature_type discriminates the signature shape; the SDK produces
+      // single-signature submissions today.
+      expect(transaction.signature_type).to.equal(
+        'Single'
+      );
+      if (
+        transaction.signature_type !== 'Single'
+      ) {
+        throw new Error(
+          '[1Money SDK integration]: expected a single-signature transaction'
+        );
+      }
+      expect(
+        Object.keys(transaction.signature).sort()
+      ).to.deep.equal(['r', 's', 'v']);
+      // v2 signs with 0/1 parity, never legacy 27/28.
+      expect([0, 1]).to.include(
+        transaction.signature.v
+      );
+
+      assertNoUnmodelledKeys(
+        transaction,
+        TRANSACTION_KEYS,
+        'transaction read'
+      );
+    });
+
+    it('returns null placement fields until the transaction is in a checkpoint', async function () {
+      // A transaction read succeeds well before checkpoint inclusion, and the
+      // node emits these keys as null rather than omitting them -- the reason
+      // they are typed `number | null`. Inclusion was measured at ~360ms
+      // while the first read lands within a few ms, so the pre-inclusion
+      // state is reached with a wide margin rather than by luck.
+      const hash = await submitPayment();
+
+      // Phase 1: poll with no delay to reach the pre-inclusion window. Every
+      // read seen here must have all three fields null together -- a
+      // partially-placed read would let a caller see an index without the
+      // checkpoint that identifies it.
+      let sawPending = false;
+      for (let attempt = 0; attempt < 400; attempt += 1) {
+        let transaction;
+        try {
+          transaction =
+            await context.client.transactions.getByHash(
+              hash
+            );
+        } catch {
+          continue;
+        }
+
+        const placement = [
+          transaction.transaction_index,
+          transaction.checkpoint_number,
+          transaction.checkpoint_hash
+        ];
+        const nulls = placement.filter(
+          field => field === null
+        ).length;
+        expect(
+          nulls,
+          `mixed placement state: ${JSON.stringify(placement)}`
+        ).to.be.oneOf([0, 3]);
+
+        if (nulls === 0) {
+          break;
+        }
+        sawPending = true;
+        // Null, not absent: the key itself is present.
+        expect(transaction).to.have.property(
+          'transaction_index'
+        );
+      }
+
+      expect(
+        sawPending,
+        'never observed the pre-inclusion state; the read raced ahead of checkpoint inclusion'
+      ).to.equal(true);
+
+      // Phase 2: the tight loop above finishes inside the inclusion window,
+      // so wait for placement on the normal polling budget rather than
+      // spinning.
+      const settled = await waitForResult(async () => {
+        const transaction =
+          await context.client.transactions.getByHash(
+            hash
+          );
+        if (
+          transaction.transaction_index === null
+        ) {
+          throw new Error(
+            'transaction is not in a checkpoint yet'
+          );
+        }
+        return transaction;
+      }, RECEIPT_POLL);
+
+      expect(
+        settled.checkpoint_number
+      ).to.be.a('number');
+      expect(settled.checkpoint_hash).to.be.a(
+        'string'
+      );
+    });
+  });
 });
